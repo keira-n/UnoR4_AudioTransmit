@@ -1,5 +1,5 @@
-# UnoR4_AudioTransmit
-Record a short audio and send as multiple chunks of JSONs to a server for prediction.
+# UnoR4_CoughAudioTransmit
+Record a short audio and send as multiple chunks of JSONs to a server for prediction.<br/><br/>
 
 ## How to find a website's CA root certificate on Google Chrome
 ### Find the "View site information button"
