@@ -2,7 +2,8 @@
 Record a short audio and send as multiple chunks of JSON payloads to a server for prediction.<br/><br/>
 
 > [!NOTE]
-> In collaboration with [River1808]([https://github.com/River1808](https://github.com/River1808/flask-cough-api)) <br/>
+> In collaboration with [River1808](https://github.com/River1808/flask-cough-api) <br/>
+<br/>
 
 ## Hardware
 Arduino Uno R4 Wifi Board<br/>
