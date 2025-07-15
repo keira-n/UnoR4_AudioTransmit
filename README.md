@@ -32,5 +32,5 @@ Once you have found the file, open it in notepad or any text editor. You should 
 \[Encoded Certificate]
 -----END CERTIFICATE-----
 ```
-> Reminder!
+> Reminder!<br/>
 > Double-check the right format for your programming language!
