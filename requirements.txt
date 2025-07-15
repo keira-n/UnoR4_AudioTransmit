@@ -1,0 +1,7 @@
+Arduino Libraries
+----------------------
+Arduino_GFX_Library
+arduinoFFT
+WiFiS3
+Arduino_JSON
+---------------------
