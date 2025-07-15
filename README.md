@@ -1,10 +1,15 @@
 # UnoR4_CoughAudioTransmit
 Record a short audio and send as multiple chunks of JSONs to a server for prediction.<br/><br/>
 
+## Hardware
+Arduino Uno R4 Wifi Board<br/>
+MAX9814 Microphone<br/>
+ILI9341 LCD Display<br/>
+8-Channel Bi-directional Level Shifter (Converts voltage levels between 5V and 3.3V for board and display communication)<br/><br/>
 ## How to find a website's CA root certificate on Google Chrome
 ### Find the "View site information button"
 
-<img width="1656" height="848" alt="image" src="https://github.com/user-attachments/assets/2e78c79c-c96b-4347-9410-b97619695e04" /><br/>
+<img width="1600" height="848" alt="image" src="https://github.com/user-attachments/assets/2e78c79c-c96b-4347-9410-b97619695e04" /><br/>
 
 ### Look for this part
 If the connection is secure it should look like this.<br/>
