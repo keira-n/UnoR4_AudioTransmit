@@ -1,5 +1,5 @@
 # UnoR4_CoughAudioTransmit
-Record a short audio and send as multiple chunks of JSONs to a server for prediction.<br/><br/>
+Record a short audio and send as multiple chunks of JSON payloads to a server for prediction.<br/><br/>
 
 ## Hardware
 Arduino Uno R4 Wifi Board<br/>
