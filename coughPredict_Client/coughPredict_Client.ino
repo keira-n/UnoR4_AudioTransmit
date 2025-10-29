@@ -1,16 +1,14 @@
 #include <Arduino_GFX_Library.h>
 #include <arduinoFFT.h>
 #include <WiFiS3.h>
-#include <Arduino_JSON.h>
 
-// CA root cert
+// CA SSL root certificate to verify HTTPS server
 const char* flask_ca = \
 "-----BEGIN CERTIFICATE-----\n" \
-// Add your own cert
+
 "-----END CERTIFICATE-----\n";
 
-// Pins and const
-// Adjust this to your own wire mapping
+// Pins & constants
 #define SAMPLES 64
 #define SAMPLING_FREQUENCY 8000
 #define MIC_PIN A0
@@ -18,85 +16,62 @@ const char* flask_ca = \
 #define TFT_DC 8
 #define TFT_RST 9
 
-// WiFi and server
-const char* ssid = "Your SSID (Network name)";
+// Wi‑Fi & server
+const char* ssid = "Your Wi-Fi";
 const char* password = "Password";
-const char* host = "Host address";
-const uint16_t httpsPort = 443; // Default HTTPS port
-const String endpoint = "";
+const char* host = "Server";
+const uint16_t httpsPort = 443; // Default port
+const String endpoint = "/function";
 
-// Audio recording parameters
-const int sampleRate = 8000; // 8kHz
-const int totalSeconds = 5;
-const int totalSamples = sampleRate * totalSeconds; // 40000 samples
-const int chunkSamples = 400;                       // 400 samples per chunk
-const int chunksCount = totalSamples / chunkSamples; // 100 chunks total
+// WAV recording params
+const int sampleRate = 4000; // Hz
+const float totalSeconds = 2;
+const int totalSamples = (int)(sampleRate * totalSeconds);
+uint8_t audioBuffer[totalSamples];
+int sampleIndex = 0;
 
-uint8_t audioChunkBuffer[chunkSamples];
-int currentChunkIndex = 0;
-
+// Timing
 unsigned long samplingPeriod_us;
+unsigned long lastSampleMicros = 0;
 
-// Energy detection variables
+// Detection thresholds
 double backgroundEnergy = 0;
 const double alpha = 0.05, thresholdMultiplier = 2.5;
 #define ENERGY_HISTORY_SIZE 5
 double energyHistory[ENERGY_HISTORY_SIZE] = {0};
 int energyIndex = 0;
-String lastStatus = "";
 
-// Network client
-WiFiSSLClient wifiSSL;
-String lastPrediction = "";
-const unsigned long startupDelayMs = 10000;
+// State flags
+bool isRecording = false, isSending = false;
+unsigned long lastDetection = 0;
+const unsigned long cooldownMs = 1000;
+String lastStatus = "", lastPrediction = "";
+bool predictionUpdated = false; // For displaying purposes
 
-// Operation status
-bool isRecording = false;
-bool isSending = false;
+// Grace period parameters
+bool gracePeriodPassed = false;
+unsigned long gracePeriodStartTime = 0;
+const unsigned long gracePeriodDuration = 10000; // 10 s
 
-String sessionID = "";
-
-// TFT display objects
+// TFT display (adjust according to hardware)
 Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC, TFT_CS);
 Arduino_GFX *gfx = new Arduino_ILI9341(bus, TFT_RST);
 
-// FFT objects
+// FFT initialising
 double vReal[SAMPLES], vImag[SAMPLES];
 ArduinoFFT<double> FFT(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
 
-unsigned long lastSampleMicros = 0;
-int sampleIndex = 0;
-
-unsigned long lastDetection = 0, coughMessageEnd = 0;
-const unsigned long cooldownMs = 1000;
-
-bool gracePeriodPassed = false;
-unsigned long gracePeriodStartTime = 0;
-const unsigned long gracePeriodDuration = 10000; // 10 seconds grace period
-
-// Generate random SessionID
-String generateSessionID(int length) {
-  const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  String session = "";
-  for (int i = 0; i < length; i++) {
-    session += charset[random(0, sizeof(charset) - 1)];
-  }
-  return session;
-}
+// Wi‑Fi
+WiFiSSLClient wifiSSL;
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  randomSeed(analogRead(A3));
-  sessionID = generateSessionID(6);
-  Serial.print("Session ID: ");
-  Serial.println(sessionID);
-
+  // Start screen
   gfx->begin();
-  gfx->setRotation(3);
+  gfx->setRotation(3); // Landscape for this specific display
   gfx->fillScreen(BLACK);
-
   gfx->setTextSize(2);
   gfx->setTextColor(WHITE, BLACK);
   gfx->setCursor(90, 10);
@@ -104,272 +79,255 @@ void setup() {
 
   samplingPeriod_us = round(1e6 / SAMPLING_FREQUENCY);
 
-  connectToWiFi();
-  
-  // Start grace period as soon as WiFi is connected
-  gracePeriodStartTime = millis();  // Record when grace period starts
-  gracePeriodPassed = false;         // Reset grace period flag
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  gracePeriodStartTime = millis();
+  gracePeriodPassed = false;
   Serial.println("Grace period started.");
+
+  gfx->setCursor(10, 110);
+  gfx->setTextSize(2);
+  gfx->setTextColor(YELLOW, BLACK);
+  gfx->print("Prediction: ---"); // No prediction yet
+
 }
 
+// Running loop
 void loop() {
   unsigned long now = millis();
 
-  // Check if grace period is still active
+  // Grace period to learn background noises
   if (!gracePeriodPassed) {
+    double e = fetchEnergy();
+    renderDisplay(e, e > backgroundEnergy * thresholdMultiplier);
     if (now - gracePeriodStartTime >= gracePeriodDuration) {
       gracePeriodPassed = true;
-      Serial.println("Grace period done. System is ready.");
-    } else {
-      Serial.println("Stabilizing system. Grace period in effect...");
-
-      // Continue monitoring sound levels for cough detection during grace period (stabilising)
-      sampleAudioFFT();
-      double coughEnergy = calculateCoughEnergy();
-      updateBackgroundNoise(coughEnergy);
-      double dynT = backgroundEnergy * thresholdMultiplier;
-      updateEnergyHistory(coughEnergy, dynT);
-
-      bool coughDetected = isSustainedEnergy();
-      if (coughDetected && now - lastDetection > cooldownMs) {
-        lastDetection = now;
-        Serial.println("Cough detected (During Grace Period).");
-      }
-      displayCurrentSoundLevel(coughEnergy, false);
-      return;
+      Serial.println("Grace period done.");
     }
+    return;
   }
 
-  // After grace period, proceed with the other operations
+  // Post-grace: start detecting cough
   if (!isRecording && !isSending) {
-    sampleAudioFFT();
-    double coughEnergy = calculateCoughEnergy();
-    updateBackgroundNoise(coughEnergy);
-    double dynT = backgroundEnergy * thresholdMultiplier;
-    updateEnergyHistory(coughEnergy, dynT);
+    double e = fetchEnergy();
+    bool cough = e > backgroundEnergy * thresholdMultiplier && isSustainedEnergy(); // A cough is when current energy reaches higher than normal and
+    renderDisplay(e, cough);                                                        // sustained energy for a short period (sudden spike)
 
-    bool coughDetected = isSustainedEnergy() && (now - lastDetection > cooldownMs);
-
-    if (coughDetected) {
+    // Start recording if cough detection is triggered
+    if (cough && now - lastDetection > cooldownMs) {
       lastDetection = now;
-
-      if (now >= startupDelayMs) {
-        coughMessageEnd = now + 1000;
-        Serial.println("Cough detected. Recording...");
-        isRecording = true;
-        sampleIndex = 0;
-        currentChunkIndex = 0;
-      } else {
-        Serial.println("Cough detected during grace period.");
-      }
+      Serial.println("Cough detected - start recording WAV.");
+      isRecording = true;
+      sampleIndex = 0;
+      lastSampleMicros = micros();
     }
-
-    displayCurrentSoundLevel(coughEnergy, (now < coughMessageEnd));
   }
 
-  // Handle recording and sending after detection
-  if (isRecording) {
-    recordAudioChunk();
-  }
+  // Record WAV into buffer
+  if (isRecording) recordWavSample();
 
-  if (isSending) {
-    sendCurrentChunk();
+  // Send WAV when ready
+  if (isSending) sendWavFile();
+
+  if (predictionUpdated) {
+    renderPrediction();  // Refresh LCD
+    predictionUpdated = false;
   }
 }
 
-// Audio Sampling for FFT
-void sampleAudioFFT() {
-  for (int i = 0; i < SAMPLES; i++) {
+// Combined audio sampling + FFT + energy tracking
+// Compute how much sound energy lies in the human voice range
+double fetchEnergy() {
+  for (int i = 0; i < SAMPLES; i++) { // Read mic samples
     unsigned long t0 = micros();
     vReal[i] = analogRead(MIC_PIN);
     vImag[i] = 0;
     while (micros() - t0 < samplingPeriod_us);
   }
-}
 
-double calculateCoughEnergy() {
+  // Apply windowing + FFT
   FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
   FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
   FFT.complexToMagnitude(vReal, vImag, SAMPLES);
 
+  // Compute total energy within range
   double sum = 0;
   for (int i = 3; i < SAMPLES / 2; i++) {
     double freq = i * SAMPLING_FREQUENCY / SAMPLES;
-    if (freq >= 300 && freq <= 2000) sum += vReal[i];
+    if (freq >= 300 && freq <= 2000) sum += vReal[i]; // 300-2000 Hz is suitable for cough detection
   }
-  return sum;
-}
 
-// Energy Analysis
-void updateBackgroundNoise(double e) {
-  backgroundEnergy = (1 - alpha) * backgroundEnergy + alpha * e;
-}
-
-void updateEnergyHistory(double e, double t) {
-  energyHistory[energyIndex] = (e > t) ? e : 0;
+  backgroundEnergy = (1 - alpha) * backgroundEnergy + alpha * sum; // Adaptive background noise estimation
+  // Store recent energy lvls for sustained detection (constaint high lvl noises)
+  energyHistory[energyIndex] = sum > backgroundEnergy * thresholdMultiplier ? sum : 0;
   energyIndex = (energyIndex + 1) % ENERGY_HISTORY_SIZE;
+
+  return sum;
 }
 
 bool isSustainedEnergy() {
   int count = 0;
-  for (int i = 0; i < ENERGY_HISTORY_SIZE; i++) {
+  for (int i = 0; i < ENERGY_HISTORY_SIZE; i++)
     if (energyHistory[i] > 0) count++;
-  }
-  return count >= 2;
+  return count >= 2; // At least 2 high-energy frames
 }
 
-// Display
-void displayCurrentSoundLevel(double energy, bool cough) {
+void renderDisplay(double energy, bool cough) {
   const int x = 0, y = 40, w = 320, h = 15;
-  gfx->fillRect(x, y, w, h, DARKGREY);  // Clear the old bar
-  int len = constrain((int)(energy / 6000.0 * w), 0, w);  // Normalise energy for the bar
-  uint16_t c = cough ? BLUE : GREEN;  // Use blue for cough detection, green for normal
-  gfx->fillRect(x, y, len, h, c);  // Draw the energy bar
+  // Bar for noise lvl
+  gfx->fillRect(x, y, w, h, DARKGREY);
+  int len = constrain((int)(energy / 6000.0 * w), 0, w);
+  uint16_t c = cough ? BLUE : GREEN;
+  gfx->fillRect(x, y, len, h, c);
 
+  // Status text
   String st = cough ? "Cough Detected" : "Ambient Noise";
   if (st != lastStatus) {
-    gfx->fillRect(x, y + h + 10, w, 20, BLACK);  // Clear previous text
+    gfx->fillRect(x, y + h + 10, w, 20, BLACK);
     gfx->setCursor(x + 10, y + h + 10);
     gfx->setTextSize(2);
     gfx->setTextColor(c, BLACK);
     gfx->print(st);
     lastStatus = st;
   }
+}
 
-  // Display the prediction message
-  if (lastPrediction != "") {
-    gfx->fillRect(x, y + h + 30, w, 20, BLACK);  // Clear previous prediction
-    gfx->setCursor(x + 10, y + h + 40);
-    gfx->setTextSize(2);
-    gfx->setTextColor(WHITE, BLACK); 
-    gfx->print("Prediction: ");
-    gfx->print(lastPrediction);
-  }
+void renderPrediction() {
+  const int x = 0, y = 110, w = 320, h = 40;
+  
+  // Clear prediction area
+  gfx->fillRect(x, y, w, h, BLACK);
+
+  // Print title
+  gfx->setCursor(x + 10, y);
+  gfx->setTextSize(2);
+  gfx->setTextColor(WHITE, BLACK);
+  gfx->print("Prediction:");
+
+  // Print prediction text below the title
+  gfx->setCursor(x + 10, y + 20);
+  gfx->setTextSize(2);
+  gfx->setTextColor(YELLOW, BLACK);
+  gfx->print(lastPrediction);
 }
 
 
-// WiFi connection and status
-void connectToWiFi() {
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(ssid, password);
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 60) {
-    Serial.print(".");
-    delay(500);
-    tries++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\n[!!!] WiFi connection failed.");
-  }
-}
-
-// Recording in chunks
-void recordAudioChunk() {
-  unsigned long now = micros();  // Track time in microseconds
-  if (now - lastSampleMicros >= 125) {  // 125 us per sample for 8kHz sampling rate
+void recordWavSample() {
+  unsigned long now = micros();
+  if (now - lastSampleMicros >= (1000000 / sampleRate)) {
     lastSampleMicros = now;
+    audioBuffer[sampleIndex++] = analogRead(MIC_PIN) >> 2; // 10-bit to 8-bit
 
-    // Read mic, convert 10-bit to 8-bit by shifting 2 bits right
-    audioChunkBuffer[sampleIndex] = analogRead(MIC_PIN) >> 2;
-    sampleIndex++;
-
-    if (sampleIndex >= chunkSamples) {
-      // Finished one chunk
-      Serial.print("Chunk ");
-      Serial.print(currentChunkIndex + 1);
-      Serial.print("/"); 
-      Serial.println(chunksCount);
-
-      currentChunkIndex++;
-      sampleIndex = 0;
-
-      if (currentChunkIndex >= chunksCount) {
-        // Done recording all chunks
-        isRecording = false;
-        isSending = true;
-        currentChunkIndex = 0;
-        Serial.println("Recording done. Sending...");
-      }
+    if (sampleIndex >= totalSamples) {
+      isRecording = false;
+      isSending = true; 
+      Serial.println("Recording complete.");
     }
   }
 }
 
-// Send one chunk at a time
-void sendCurrentChunk() {
-  Serial.print("Sending chunk ");
-  Serial.print(currentChunkIndex + 1);
-  Serial.print("/"); 
-  Serial.println(chunksCount);
+  void sendWavFile() {
+    Serial.println("Sending WAV file...");
+    wifiSSL.setCACert(flask_ca); // CA cert is needed for HTTPS
 
-  wifiSSL.setCACert(flask_ca);
-  if (!wifiSSL.connect(host, httpsPort)) {
-    Serial.println("[!!!] HTTPS connection failed");
-    return;
-  }
-
-  // Prepare JSON audio array string for the current chunk
-  String audioArray = "[";
-  for (int i = 0; i < chunkSamples; i++) {
-    audioArray += String(audioChunkBuffer[i]);
-    if (i < chunkSamples - 1) audioArray += ",";
-  }
-  audioArray += "]";
-
-  String payload = "{\"session_id\":\"" + sessionID + "\"," +
-                   "\"chunk_id\":" + String(currentChunkIndex) + "," +
-                   "\"total_chunks\":" + String(chunksCount) + "," +
-                   "\"audio\":" + audioArray + "}";
-
-  wifiSSL.print("POST " + endpoint + " HTTP/1.1\r\n");
-  wifiSSL.print("Host: " + String(host) + "\r\n");
-  wifiSSL.print("Content-Type: application/json\r\n");
-  wifiSSL.print("Content-Length: " + String(payload.length()) + "\r\n");
-  wifiSSL.print("Connection: close\r\n\r\n");
-  wifiSSL.print(payload);
-
-  // Read response only on last chunk
-  if (currentChunkIndex == chunksCount - 1) {
-    String response = "";
-    unsigned long timeout = millis() + 3000;
-    while (wifiSSL.connected() && millis() < timeout) {
-      while (wifiSSL.available()) {
-        char c = wifiSSL.read();
-        response += c;
-      }
+    // HTTPS connection
+    if (!wifiSSL.connect(host, httpsPort)) {
+      Serial.println("[!] HTTPS connect failed.");
+      isSending = false;
+      return;
     }
 
-    // Print response
-    Serial.println("Full response:");
-    Serial.println(response);
+    // WAV header
+    uint8_t header[44]; 
+    writeWavHeader(header, totalSamples, sampleRate, 8, 1);
+    uint32_t length = 44 + totalSamples;
 
-    // Look for the prediction that contains the conclusion
-    int startIndex = response.indexOf("<strong>Prediction:</strong>") + strlen("<strong>Prediction:</strong>");
-    int endIndex = response.indexOf("</p>", startIndex);  // Find the end of the prediction paragraph
+    // HTTP POST
+    wifiSSL.print("POST " + endpoint + " HTTP/1.1\r\n");
+    wifiSSL.print("Host: " + String(host) + "\r\n");
+    wifiSSL.print("Content-Type: audio/wav\r\n");
+    wifiSSL.print("Content-Length: " + String(length) + "\r\n");
+    wifiSSL.print("Connection: close\r\n\r\n");
 
-    if (startIndex != -1 && endIndex != -1) {
-        String conclusion = response.substring(startIndex, endIndex);
-        Serial.print("Conclusion received: ");
-        Serial.println(conclusion);
-        conclusion.trim();  // Remove any surrounding whitespace
-        lastPrediction = conclusion;  // Store the conclusion message
+    // Send WAV header + data
+    wifiSSL.write(header, 44);
+    wifiSSL.write(audioBuffer, totalSamples);
 
-        // Debug: Check the prediction
-        Serial.print("lastPrediction: ");
-        Serial.println(lastPrediction);  // Debug line to print lastPrediction
-    } else {
-        Serial.println("[!!!] Conclusion not found in the response.");
-    }
+  // Read response
+  String resp = "";
+  unsigned long timeout = millis() + 5000;
+  while (wifiSSL.connected() && millis() < timeout) {
+    while (wifiSSL.available()) resp += char(wifiSSL.read());
   }
+
+  Serial.println("Server response:");
+  Serial.println(resp);
+  extractPrediction(resp);
 
   wifiSSL.stop();
+  isSending = false;
+}
 
-  currentChunkIndex++;
-  if (currentChunkIndex >= chunksCount) {
-    Serial.println("All chunks sent.");
-    isSending = false;
+void extractPrediction(const String& resp) {
+  String prediction = "";
+
+  // Look for specific phrases
+  int start = resp.indexOf("Your prediction label response from server");
+  if (start != -1) {
+    // Find the colon that separates the label from the actual result
+    start = resp.indexOf(":", start);
+    if (start != -1) {
+      prediction = resp.substring(start + 1);
+    }
+  } else {
+    int alt = resp.indexOf("Prediction:");
+    if (alt != -1) prediction = resp.substring(alt + 11);
+    else prediction = resp;
   }
+
+  prediction.trim();
+  if (prediction.length() == 0) prediction = "No prediction";
+
+  // Store and display
+  lastPrediction = prediction;
+  predictionUpdated = true;
+  
+  Serial.print("Prediction: ");
+  Serial.println(prediction);
+  
+  renderPrediction();
+}
+
+// WAV header helper
+// 44-byte (PCM, 8-bit mono)
+void writeWavHeader(uint8_t* buf, uint32_t totalAudioLen, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
+  uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+  uint32_t dataChunkSize = totalAudioLen;
+  uint32_t chunkSize = 36 + dataChunkSize;
+
+  memcpy(buf, "RIFF", 4);
+  buf[4] = chunkSize & 0xff; buf[5] = (chunkSize >> 8) & 0xff;
+  buf[6] = (chunkSize >> 16) & 0xff; buf[7] = (chunkSize >> 24) & 0xff;
+  memcpy(buf + 8, "WAVEfmt ", 8);
+  buf[16] = 16; buf[17] = buf[18] = buf[19] = 0;
+  buf[20] = 1; buf[21] = 0;
+  buf[22] = channels; buf[23] = 0;
+  buf[24] = sampleRate & 0xff; buf[25] = (sampleRate >> 8) & 0xff;
+  buf[26] = (sampleRate >> 16) & 0xff; buf[27] = (sampleRate >> 24) & 0xff;
+  buf[28] = byteRate & 0xff; buf[29] = (byteRate >> 8) & 0xff;
+  buf[30] = (byteRate >> 16) & 0xff; buf[31] = (byteRate >> 24) & 0xff;
+  uint16_t blockAlign = channels * bitsPerSample / 8;
+  buf[32] = blockAlign; buf[33] = 0;
+  buf[34] = bitsPerSample; buf[35] = 0;
+  memcpy(buf + 36, "data", 4);
+  buf[40] = dataChunkSize & 0xff; buf[41] = (dataChunkSize >> 8) & 0xff;
+  buf[42] = (dataChunkSize >> 16) & 0xff; buf[43] = (dataChunkSize >> 24) & 0xff;
 }
